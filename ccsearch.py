@@ -16,6 +16,8 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import difflib
+import gzip
+import hashlib
 import json
 import os
 import re
@@ -39,6 +41,8 @@ except ImportError:  # pragma: no cover
 PROJECTS = Path(os.environ.get("CCS_PROJECTS", Path.home() / ".claude" / "projects"))
 CACHE = Path(os.environ.get("CCS_CACHE", Path.home() / ".cache" / "ccsearch"))
 DB_PATH = CACHE / "index.sqlite"
+_backup = os.environ.get("CCS_BACKUP", str(Path.home() / ".local" / "share" / "ccsearch" / "transcripts"))
+BACKUP = None if _backup.lower() in ("", "0", "off", "no", "false") else Path(_backup)
 MODEL_NAME = "minishlab/potion-retrieval-32M"
 SCHEMA_VERSION = "4"
 
@@ -300,6 +304,8 @@ def connect():
         CREATE TABLE IF NOT EXISTS chunks(
             id INTEGER PRIMARY KEY, turn_id INTEGER, session_id TEXT, kind TEXT, text TEXT, vec BLOB);
         CREATE TABLE IF NOT EXISTS links(session_id TEXT, url TEXT, ts TEXT);
+        CREATE TABLE IF NOT EXISTS backups(path TEXT PRIMARY KEY, session_id TEXT, dest TEXT,
+            size INTEGER, tail TEXT, gz_size INTEGER);
         CREATE INDEX IF NOT EXISTS turns_s ON turns(session_id);
         CREATE INDEX IF NOT EXISTS chunks_s ON chunks(session_id);
         CREATE INDEX IF NOT EXISTS links_s ON links(session_id);
@@ -349,6 +355,7 @@ def update_index(db, verbose=True, force=False):
     known = {r[0]: (r[1], r[2]) for r in db.execute("SELECT path, mtime, size FROM files")}
     stale = [p for p, s in current.items() if force or known.get(p) != s]
     gone = [p for p in known if p not in current]
+    backup_transcripts(db, current, verbose)
     for p in gone:
         # Claude Code deletes transcripts after cleanupPeriodDays (default 30); keep what we
         # indexed so the session stays searchable, it just can't be resumed any more
@@ -405,6 +412,89 @@ def update_index(db, verbose=True, force=False):
         db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?)", (path, *current[path]))
     db.commit()
     return len(stale)
+
+
+# --------------------------------------------------------------------------- backups
+
+def _tail(path, size, n=4096):
+    with open(path, "rb") as fh:
+        fh.seek(max(0, size - n))
+        return hashlib.sha1(fh.read(size - max(0, size - n))).hexdigest()
+
+
+def _copy(src, out, n):
+    while n > 0:
+        b = src.read(min(n, 1 << 20))
+        if not b:
+            break
+        out.write(b)
+        n -= len(b)
+
+
+def backup_transcripts(db, current, verbose=True):
+    """Keep a gzip copy of every transcript, so a session that Claude Code's cleanup deletes
+    can be restored and resumed. Transcripts only grow, so a run appends just the new bytes as
+    another gzip member; a transcript that changed otherwise, or a backup that doesn't match
+    what was recorded (an interrupted append), is copied whole."""
+    if BACKUP is None:
+        return 0
+    known = {r[0]: r[1:] for r in db.execute("SELECT path, size, tail, gz_size FROM backups")}
+    todo = [p for p, (_, size) in current.items() if (known.get(p) or (None,))[0] != size]
+    if verbose and len(todo) > 5:
+        print(f"ccs: backing up {len(todo)} transcript(s) to {BACKUP}…", file=sys.stderr)
+    for p in todo:
+        src, size = Path(p), current[p][1]
+        dest = BACKUP / src.parent.name / (src.name + ".gz")
+        old = known.get(p)
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(src, "rb") as fh:
+                if (old and dest.exists() and dest.stat().st_size == old[2] and old[0] < size
+                        and _tail(src, old[0]) == old[1]):
+                    fh.seek(old[0])
+                    with gzip.open(dest, "ab", compresslevel=1) as out:
+                        _copy(fh, out, size - old[0])
+                else:
+                    tmp = dest.with_name(dest.name + ".tmp")
+                    with gzip.open(tmp, "wb", compresslevel=1) as out:
+                        _copy(fh, out, size)
+                    os.replace(tmp, dest)
+            db.execute("INSERT OR REPLACE INTO backups VALUES(?,?,?,?,?,?)",
+                       (p, src.stem, str(dest), size, _tail(src, size), dest.stat().st_size))
+        except OSError as e:  # vanished or unreadable mid-way: try again next run
+            print(f"ccs: could not back up {src.name}: {e}", file=sys.stderr)
+    db.commit()
+    return len(todo)
+
+
+def find_backup(db, prefix):
+    """(transcript path, session id, backup file) for one session id prefix, or exit."""
+    rows = db.execute("SELECT path, session_id, dest FROM backups WHERE session_id LIKE ?",
+                      (prefix + "%",)).fetchall()
+    if not rows and BACKUP:  # the index was rebuilt, but the files are still there
+        rows = [(str(PROJECTS / g.parent.name / g.name[:-3]), g.name[:-9], str(g))
+                for g in BACKUP.glob(f"*/{prefix}*.jsonl.gz")]
+    if not rows:
+        sys.exit(f"ccs: no backup of a session starting with {prefix!r}")
+    if len({r[1] for r in rows}) > 1:
+        sys.exit(f"ccs: several sessions start with {prefix!r}; give more of the id")
+    return rows[0]
+
+
+def restore(db, prefix):
+    """Put a deleted transcript back where Claude Code looks for it. Returns (path, session id)."""
+    path, sid, dest = find_backup(db, prefix)
+    path = Path(path)
+    if path.exists():
+        print(f"ccs: {path.name} is still there; nothing to restore", file=sys.stderr)
+        return path, sid
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".ccs-restore")
+    with gzip.open(dest, "rb") as src, open(tmp, "wb") as out:
+        shutil.copyfileobj(src, out, 1 << 20)
+    os.replace(tmp, path)  # a fresh mtime, so cleanup gives it another cleanupPeriodDays
+    update_index(db, verbose=False)
+    return path, sid
 
 
 # --------------------------------------------------------------------------- search
@@ -534,6 +624,51 @@ def search(db, query, k=8, project=None, since=None, until=None, exclude=None):
     return results, fixes
 
 
+def session_turns(db, prefix, query=None, start=0, limit=10):
+    """(session row, [(position, ts, kind, prompt, reply)]) for one session id prefix: the turns
+    most relevant to `query` (dense + BM25 within the session, shown in session order), or
+    `limit` turns from `start`. None if the prefix matches no session or several."""
+    rows = db.execute("SELECT session_id, cwd, title, ai_title, first_ts, last_ts, n_prompts, "
+                      "first_prompt, archived FROM sessions WHERE session_id LIKE ?",
+                      (prefix + "%",)).fetchall()
+    if len(rows) != 1:
+        return None
+    sid = rows[0][0]
+    turns = db.execute("SELECT id, ts, kind, prompt, reply FROM turns WHERE session_id=? "
+                       "ORDER BY id", (sid,)).fetchall()
+    pos = {t[0]: i for i, t in enumerate(turns)}
+    if query:
+        chunks = db.execute("SELECT id, turn_id, vec FROM chunks WHERE session_id=? "
+                            "AND turn_id IS NOT NULL", (sid,)).fetchall()
+        score = defaultdict(float)
+        if chunks:
+            mat = np.frombuffer(b"".join(r[2] for r in chunks), dtype=np.float16).reshape(len(chunks), -1)
+            sims = mat.astype(np.float32) @ embed([query])[0].astype(np.float32)
+            best = {}
+            for r, i in enumerate(np.argsort(-sims)):
+                best.setdefault(chunks[i][1], r)
+            for tid, r in best.items():
+                score[tid] += 1.0 / (RRF_K + r)
+            words, fixes = understand(db, query)
+            terms = [t for w in words if w not in STOP and len(w) > 1 for t in {w, fixes.get(w, w)}]
+            if terms:
+                owner = {r[0]: r[1] for r in chunks}
+                fts_q = " OR ".join('"' + t.replace('"', "") + '"' for t in terms)
+                lex = db.execute(f"SELECT rowid FROM fts WHERE fts MATCH ? AND rowid IN "
+                                 f"({','.join('?' * len(owner))}) ORDER BY bm25(fts)",
+                                 (fts_q, *owner)).fetchall()
+                seen = set()
+                for r, (cid,) in enumerate(lex):
+                    if owner[cid] not in seen:
+                        seen.add(owner[cid])
+                        score[owner[cid]] += 1.0 / (RRF_K + len(seen) - 1)
+        picked = sorted(sorted(score, key=lambda t: -score[t])[:limit], key=pos.get)
+    else:
+        picked = [t[0] for t in turns[start:start + limit]]
+    by_id = {t[0]: t for t in turns}
+    return rows[0], [(pos[t], *by_id[t][1:]) for t in picked]
+
+
 # --------------------------------------------------------------------------- output
 
 def _c(code, s):
@@ -572,6 +707,8 @@ def hydrate(db, results):
         r.update(dict(zip(("cwd", "title", "ai_title", "first_ts", "last_ts", "n_prompts",
                            "first_prompt", "forked_from", "branch", "archived"), s)))
         r["name"] = r["title"] or r["ai_title"] or (r["first_prompt"] or "")[:60]
+        r["backup"] = bool(r["archived"]) and db.execute(
+            "SELECT 1 FROM backups WHERE session_id=?", (r["session_id"],)).fetchone() is not None
         mom = []
         for _, tid in r["moments"]:
             t = db.execute("SELECT ts, kind, prompt, reply FROM turns WHERE id=?", (tid,)).fetchone()
@@ -627,6 +764,8 @@ def show(results, query_shown):
             print(f"    {_c('2', _local(m['ts']))}  {txt}")
         if r.get("device"):
             print(f"    {_c('32', r['resume'])}")
+        elif r.get("backup"):
+            print(f"    {_c('2', 'transcript deleted by Claude Code cleanup; picking it restores the backup')}")
         elif r.get("archived"):
             print(f"    {_c('2', 'transcript deleted by Claude Code cleanup; searchable, not resumable')}")
         else:
@@ -635,7 +774,7 @@ def show(results, query_shown):
             print(f"    {_c('2', 'also in fork: claude --resume ' + f)}")
 
 
-def pick_and_resume(results):
+def pick_and_resume(results, db=None):
     try:
         choice = input(_c("1", "\nresume # (Enter to quit): ")).strip()
     except (EOFError, KeyboardInterrupt):
@@ -648,7 +787,10 @@ def pick_and_resume(results):
         cmd = hydra_mod().remote_command(r["device"], r["cwd"], r["session_id"])
         print(_c("2", f"→ {r['resume']}"))
         os.execvp(cmd[0], cmd)
-    if r.get("archived"):
+    if r.get("archived") and r.get("backup") and db is not None:
+        path, _ = restore(db, r["session_id"])
+        print(_c("2", f"restored {_home(str(path))} from the backup"))
+    elif r.get("archived"):
         print("that transcript was deleted by Claude Code's cleanup, so it can't be resumed")
         return
     cwd = r["cwd"]
@@ -719,6 +861,133 @@ def rerank(query, results, model_name):
     return reordered
 
 
+# --------------------------------------------------------------------------- ccs ask
+
+ASK_SYS = (
+    "You answer a developer's question from excerpts of their own past Claude Code sessions. "
+    "Use only the excerpts. Cite each claim with its excerpt number in brackets, like [2]. If "
+    "the excerpts don't answer the question, say so plainly and name the closest ones. Be "
+    "concise: a few sentences or a short list."
+)
+_HEAD_RE = re.compile(
+    r"\A(?:## Message Details.*?## Message\n\n)?(?:(?:Device|Session|Project): [^\n]*\n)*\n*", re.S)
+
+
+def _chunk_text(chunk):
+    """A HydraDB chunk without the headers we and HydraDB put in front of the turn."""
+    text = chunk.get("chunk_content") or ""
+    prefix = "[claude_code] " + (chunk.get("source_title") or "")
+    if text.startswith(prefix):
+        text = text[len(prefix):]
+    return _HEAD_RE.sub("", text, count=1).strip()
+
+
+def gather(db, query, args, here, backend, limit=12, per_session=3):
+    """Excerpts that may answer `query`, best first: dicts with the session's display fields
+    and `text`. Local turns come whole from the index; turns of other machines' sessions come
+    from the chunk HydraDB returned."""
+    from ccs_redact import redact
+
+    out = []
+    if backend == "local":
+        res, _ = search(db, query, k=8, project=args.project, since=args.since, until=args.until,
+                        exclude=here)
+        for r in hydrate(db, res):
+            for m in r["moments"][:per_session]:
+                out.append({**r, "ts": m["ts"], "text": _turn_text(m["prompt"], m["reply"], m["kind"])})
+    else:
+        hy = hydra_mod()
+        chunks, _ = hy.Hydra().query(query, mode=backend)
+        allowed, keep_remote = hydra_filters(db, args, here)
+        ranked = {r["session_id"]: r for r in hydrate(
+            db, hy.rank(db, chunks, 8, allowed=allowed, keep_remote=keep_remote))}
+        seen, per = set(), defaultdict(int)
+        for ch in chunks:
+            sid, idx = hy.parse_item_id(ch.get("id") or "")
+            r = ranked.get(sid)
+            if not r or (sid, idx) in seen or per[sid] >= per_session:
+                continue
+            seen.add((sid, idx))
+            per[sid] += 1
+            turn = None if r.get("device") else db.execute(
+                "SELECT ts, kind, prompt, reply FROM turns WHERE session_id=? ORDER BY id "
+                "LIMIT 1 OFFSET ?", (sid, idx)).fetchone()
+            if turn:
+                out.append({**r, "ts": turn[0], "text": _turn_text(turn[2], turn[3], turn[1])})
+            else:
+                out.append({**r, "ts": hy.parse_chunk(ch)["ts"], "text": _chunk_text(ch)})
+    for e in out:
+        e["text"] = redact(e["text"])
+    return out[:limit]
+
+
+def _turn_text(prompt, reply, kind):
+    if kind == "summary":
+        return "[summary of an earlier part of the session] " + prompt.split("Summary:", 1)[-1][:2500]
+    return f"User: {prompt[:1500]}" + (f"\nClaude: {reply[:2500]}" if reply else "")
+
+
+def answer(query, excerpts, model):
+    """Claude's answer to `query` from `excerpts`, citing them as [n]; None if claude failed."""
+    blocks = []
+    for n, e in enumerate(excerpts, 1):
+        where = f"on {e['device']}" if e.get("device") else _home(e["cwd"])
+        blocks.append(f"[{n}] {e['name']} · {_local(e['ts'], '%Y-%m-%d')} · {where}\n{e['text']}")
+    prompt = f"Question: {query}\n\nExcerpts from past sessions:\n\n" + "\n\n".join(blocks)
+    cmd = ["claude", "-p", "--model", model, "--no-session-persistence", "--tools", "",
+           "--strict-mcp-config", "--disable-slash-commands", "--system-prompt", ASK_SYS]
+    try:
+        out = subprocess.run(cmd, input=prompt, text=True, capture_output=True, timeout=300,
+                             cwd=CACHE)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"ccs: claude failed ({e})", file=sys.stderr)
+        return None
+    if out.returncode or not out.stdout.strip():
+        print(f"ccs: claude failed: {(out.stderr or out.stdout)[:300]}", file=sys.stderr)
+        return None
+    return out.stdout.strip()
+
+
+def cited_sources(text, excerpts):
+    """Sessions behind the excerpts the answer cites (all of them if it cites none), in order,
+    each with the excerpt numbers that came from it."""
+    cited = [int(n) for n in re.findall(r"\[(\d+)\]", text) if 1 <= int(n) <= len(excerpts)]
+    nums = sorted(set(cited)) or range(1, len(excerpts) + 1)
+    by_session = {}
+    for n in nums:
+        e = excerpts[n - 1]
+        by_session.setdefault(e["session_id"], {"session_id": e["session_id"], "name": e["name"],
+                                                "resume": e["resume"], "device": e.get("device"),
+                                                "archived": e.get("archived"), "n": []})["n"].append(n)
+    return list(by_session.values())
+
+
+def run_ask(db, query, args, here):
+    if args.local or not hydra_configured():
+        backend = "local"
+    else:
+        backend = "fast" if args.hydra and not args.thinking else "thinking"
+    excerpts = gather(db, query, args, here, backend)
+    if not excerpts:
+        print("no matching sessions")
+        return
+    model = args.model or "sonnet"
+    print(_c("2", f"asking {model} with {len(excerpts)} excerpts ({backend} search)…"), file=sys.stderr)
+    text = answer(query, excerpts, model)
+    if text is None:
+        return
+    sources = cited_sources(text, excerpts)
+    if args.json:
+        print(json.dumps({"answer": text, "backend": backend, "sources": sources}, indent=2))
+        return
+    print(text)
+    print(_c("1", "\nSources"))
+    for src in sources:
+        refs = "".join(f"[{n}]" for n in src["n"])
+        note = "  (transcript deleted; ccs --restore)" if src["archived"] else ""
+        print(f"  {_c('36', refs)} {src['name']}{note}\n      {_c('32', src['resume'])}")
+
+
 # --------------------------------------------------------------------------- sync plumbing
 
 SETTINGS = Path.home() / ".claude" / "settings.json"
@@ -729,6 +998,34 @@ def hydra_mod():
     import ccs_hydra
 
     return ccs_hydra
+
+
+def hydra_filters(db, args, here):
+    """(allowed local sessions, keep_remote predicate) for a HydraDB search with these flags."""
+    allowed = allowed_sessions(db, args.project, args.since, args.until, here)
+    if args.device and args.device != hydra_mod().device_name():
+        allowed = set()  # every session in the local index is from this machine
+
+    def keep_remote(sid, info, moments):
+        """The same filters for sessions synced from other machines, judged on what HydraDB
+        returned: dates come from the matched turns only."""
+        if sid == here or (args.device and info["device"] != args.device):
+            return False
+        if args.project and not any(args.project.lower() in (v or "").lower()
+                                    for v in (info["project"], info["name"])):
+            return False
+        ts = [m["ts"] for m in moments if m["ts"]]
+        return not ts or not ((args.since and max(ts) < args.since)
+                              or (args.until and min(ts) > args.until + "T23:59:59"))
+
+    return allowed, keep_remote
+
+
+def hydra_configured():
+    try:
+        return bool(hydra_mod().settings().get("HYDRADB_API_KEY"))
+    except ImportError:  # installed without the [hydradb] extra
+        return False
 
 
 def install_hook(remove=False, settings=None):
@@ -778,13 +1075,22 @@ def detach(log):
 # --------------------------------------------------------------------------- main
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    command = argv.pop(0) if argv and argv[0] in ("ask", "mcp") else None
+    if command == "mcp":
+        import ccs_mcp
+
+        return ccs_mcp.serve(sys.modules[__name__])
     ap = argparse.ArgumentParser(
-        prog="ccs", description="Search your Claude Code sessions in natural language.")
+        prog="ccs", description="Search your Claude Code sessions in natural language. "
+        "`ccs ask \"<question>\"` answers from them instead; `ccs mcp` serves them to Claude.")
     ap.add_argument("query", nargs="*", help="what you remember about the session")
     ap.add_argument("-n", type=int, default=6, help="results to show (default 6)")
     ap.add_argument("-a", "--ask", action="store_true",
                     help="have Claude judge the top candidates and explain each match (slower)")
-    ap.add_argument("--model", default="haiku", help="model for --ask (default haiku)")
+    ap.add_argument("--model", help="model for -a (default haiku) or `ccs ask` (default sonnet)")
+    ap.add_argument("--local", action="store_true",
+                    help="`ccs ask`: search the local index even when HydraDB is set up")
     ap.add_argument("-p", "--project", help="only sessions whose dir or title contains this")
     ap.add_argument("--since", help="only sessions active on/after YYYY-MM-DD")
     ap.add_argument("--until", help="only sessions started on/before YYYY-MM-DD")
@@ -808,6 +1114,8 @@ def main(argv=None):
     hy.add_argument("--install-hook", action="store_true",
                     help="sync automatically whenever a Claude Code session ends")
     hy.add_argument("--uninstall-hook", action="store_true", help="remove that hook")
+    ap.add_argument("--restore", metavar="ID",
+                    help="bring back a transcript Claude Code's cleanup deleted, from the backup")
     args = ap.parse_args(argv)
     if args.install_hook or args.uninstall_hook:
         cmd = install_hook(remove=args.uninstall_hook)
@@ -823,12 +1131,20 @@ def main(argv=None):
     db = connect()
     update_index(db, force=args.reindex)
     here = None if args.include_current else os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if args.restore:
+        path, sid = restore(db, args.restore)
+        cwd = db.execute("SELECT cwd FROM sessions WHERE session_id=?", (sid,)).fetchone()
+        print(f"restored {_home(str(path))}\n  cd {(cwd or ['?'])[0]} && claude --resume {sid}")
+        return
     if args.stats or args.sync:
         n_s, n_t, n_c = (db.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
                          for t in ("sessions", "turns", "chunks"))
         n_a = db.execute("SELECT count(*) FROM sessions WHERE archived=1").fetchone()[0]
         print(f"{n_s} sessions ({n_a} with deleted transcripts), {n_t} turns, {n_c} chunks · "
               f"{DB_PATH} ({DB_PATH.stat().st_size / 1e6:.0f} MB)")
+        n_b, gz = db.execute("SELECT count(*), coalesce(sum(gz_size), 0) FROM backups").fetchone()
+        print(f"backups: {n_b} transcripts, {gz / 1e6:.0f} MB in {BACKUP}" if BACKUP
+              else "backups: off (CCS_BACKUP)")
     if args.sync:
         hydra = hydra_mod()
         print(hydra.sync(db, str(Path.home())))
@@ -839,35 +1155,23 @@ def main(argv=None):
             ap.print_help()
         return
 
+    if command == "ask":
+        return run_ask(db, query, args, here)
     pool = max(args.n, 15) if args.ask else args.n
     if args.hydra:
-        hydra = hydra_mod()
-        allowed = allowed_sessions(db, args.project, args.since, args.until, here)
-        if args.device and args.device != hydra.device_name():
-            allowed = set()  # every session in the local index is from this machine
-
-        def keep_remote(sid, info, moments):
-            """The same filters for sessions synced from other machines, judged on what
-            HydraDB returned: dates come from the matched turns only."""
-            if sid == here or (args.device and info["device"] != args.device):
-                return False
-            if args.project and not any(args.project.lower() in (v or "").lower()
-                                        for v in (info["project"], info["name"])):
-                return False
-            ts = [m["ts"] for m in moments if m["ts"]]
-            return not ts or not ((args.since and max(ts) < args.since)
-                                  or (args.until and min(ts) > args.until + "T23:59:59"))
-
-        results, _ = hydra.search(db, query, k=pool * 2, allowed=allowed, keep_remote=keep_remote,
-                                  mode="thinking" if args.thinking else "fast")
+        allowed, keep_remote = hydra_filters(db, args, here)
+        results, _ = hydra_mod().search(db, query, k=pool * 2, allowed=allowed,
+                                        keep_remote=keep_remote,
+                                        mode="thinking" if args.thinking else "fast")
         fixes = {}
     else:
         results, fixes = search(db, query, k=pool * 2, project=args.project, since=args.since,
                                 until=args.until, exclude=here)
     results = hydrate(db, results)
     if args.ask and results:
-        print(_c("2", f"asking {args.model} to judge {len(results)} candidates…"), file=sys.stderr)
-        results = rerank(query, results, args.model)
+        print(_c("2", f"asking {args.model or 'haiku'} to judge {len(results)} candidates…"),
+              file=sys.stderr)
+        results = rerank(query, results, args.model or "haiku")
     results = results[: args.n]
     shown = query
     if fixes:
@@ -878,7 +1182,7 @@ def main(argv=None):
         return
     show(results, shown)
     if results and not args.no_pick and sys.stdin.isatty() and sys.stdout.isatty():
-        pick_and_resume(results)
+        pick_and_resume(results, db)
 
 
 if __name__ == "__main__":

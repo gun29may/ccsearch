@@ -26,6 +26,9 @@ searches what was said: your prompts, Claude's replies, the actions it took and 
 written when a session was compacted. It runs locally, needs no API key, and answers in about
 0.2 s.
 
+It can also answer from your sessions (`ccs ask`), give Claude itself access to them over MCP,
+keep transcripts that Claude Code's 30-day cleanup would delete, and search across machines.
+
 ## Install
 
 Needs Python 3.10+ whose SQLite is 3.43 or newer (check with
@@ -66,21 +69,70 @@ ccs --json "s3 upload script" | jq '.[0].resume'
 | `--json` | machine-readable output, including the `cd … && claude --resume …` command |
 | `--no-pick` | print results without offering to resume |
 | `--include-current` | inside Claude Code the session you are in is hidden; this shows it |
-| `--stats`, `--reindex` | index size, or a rebuild from scratch |
+| `--stats`, `--reindex` | index and backup size, or a rebuild from scratch |
+| `--restore ID` | bring back a transcript Claude Code deleted (see [below](#keep-your-transcripts)) |
 | `-H`, `-t`, `--sync` | search with HydraDB instead (see [below](#hydradb-backend-optional)) |
 | `--device NAME` | only sessions from one machine (see [several machines](#several-machines)) |
 
 Picking a result runs `claude --resume <id>` in the session's original directory. Inside Claude
-Code you can run it as `! ccs "…"`, or just ask Claude to find a past chat; it can call
-`ccs --no-pick --json` itself.
+Code you can run it as `! ccs "…"`, or give Claude the [MCP tools](#claude-can-search-your-sessions-mcp).
+
+### Ask a question instead
+
+```console
+$ ccs ask "why was the payments retry test flaky and how did we fix it?"
+It slept on the real clock, so a slow CI runner hit the retry deadline [1]. The fix froze time
+with freezegun, which made the test deterministic [1][2], and raised the CI client timeout from
+5 s to 15 s [2].
+
+Sources
+  [1][2] payments retry flake
+      cd ~/code/payments && claude --resume 3f2a9c10-6b1e-4c55-9d0a-2f8e1c7b9a41
+```
+
+`ccs ask` gathers the 12 turns most likely to hold the answer, at most 3 per session. It then
+has Claude (`--model`, default `sonnet`) answer from those turns only, citing each claim. The
+sessions it cited are listed with their resume commands.
+
+- **Search backend:** HydraDB thinking mode when it is set up (it scored best in the
+  [evaluation](#evaluation)), otherwise the local index. `--local` forces the local index;
+  `-H` alone uses fast mode.
+- **Filters and output:** `-p`, `--since`, `--until`, `--device` and `--json` all work.
+- **Credentials** in the turns are [masked](#hydradb-backend-optional) before they are sent.
+
+### Claude can search your sessions (MCP)
+
+```bash
+claude mcp add --scope user ccs -- ccs mcp
+```
+
+This gives Claude Code two tools:
+
+- `search_sessions` (query, limit, project, since, until, backend)
+- `read_session` (session id; then `query` for the most relevant turns, or `start`/`limit` to page)
+
+With them, "do it like we did last time" or "what did we decide about X?" work inside any
+session: Claude finds the earlier session, reads the turns that matter and carries on.
+
+- **Implementation:** a small stdio JSON-RPC server with no dependencies. It works with Claude
+  Code and with the official MCP SDK client.
+- **What it shows:** output is masked like everything that leaves `ccs`, and the session that
+  asks is left out of results when Claude Code says which one it is.
 
 ### Keep your transcripts
 
-Claude Code deletes transcripts 30 days after their last change (`cleanupPeriodDays`). `ccs` keeps
-every session it has already indexed: when a transcript disappears the session is marked
-archived, stays searchable, and shows as not resumable. A session that was deleted before `ccs`
-ever indexed it is gone. To keep transcripts on disk longer, raise the limit in
-`~/.claude/settings.json`:
+Claude Code deletes transcripts 30 days after their last change (`cleanupPeriodDays`).
+
+- **Backups:** every time `ccs` runs, it keeps a gzip copy of each transcript in
+  `~/.local/share/ccsearch/transcripts`. Transcripts only grow, so a run appends just the new
+  bytes; about 1.5 GB of transcripts take about 320 MB, and only the first run takes a few
+  seconds.
+- **Restoring:** when a transcript disappears, its session stays searchable. Picking it (or
+  `ccs --restore <id>`) puts the transcript back and resumes it.
+- **Turning it off:** `CCS_BACKUP=off`.
+
+A session deleted before `ccs` ever saw it is gone. To keep transcripts on disk longer in the
+first place, raise the limit in `~/.claude/settings.json`:
 
 ```json
 { "cleanupPeriodDays": 3650 }
@@ -137,9 +189,18 @@ Environment variables of the same names override the file; `HYDRADB_BASE_URL` de
 `<session>__tNNNN`. Only new or changed turns are sent. Items of archived sessions are kept.
 
 **What leaves your machine:** for every turn, the machine's name, the session title, project
-directory, your prompt, Claude's final reply and the tool-action descriptions. That includes
-anything you pasted into a prompt, such as keys or customer data. Search results are filtered
-and shown locally, just like local search.
+directory, your prompt, Claude's final reply and the tool-action descriptions. Search results are
+filtered and shown locally, just like local search.
+
+- **Credentials are masked first.** They become `[redacted:<kind>]`, and `--sync` reports how
+  many it masked. That covers API keys (`sk_live_…`, `sk-…`, `ghp_…`, AWS, Google, Slack,
+  Hugging Face), JWTs, private-key blocks, passwords in URLs, bearer tokens and values assigned
+  to names like `API_KEY` or `client_secret`.
+- **The patterns are deliberately narrow**, so code, hashes and ids stay searchable. They are
+  not a guarantee: a secret in an unusual shape still goes through.
+- **Keep sessions local** with `CCS_SYNC_EXCLUDE`: comma-separated project dirs (anything under
+  them, globs allowed) or session id prefixes, e.g. `CCS_SYNC_EXCLUDE=~/clients,~/personal/*`.
+  Sessions that become excluded are deleted from HydraDB on the next sync.
 
 ### Several machines
 
@@ -227,6 +288,8 @@ Results on the author's sessions (32 sessions and about 3,300 turns, 2026-10-29)
 | `CCS_CACHE` | `~/.cache/ccsearch` | where the index lives |
 | `HYDRADB_*` | `~/.config/ccsearch/hydradb.env` | HydraDB backend, see above |
 | `CCS_DEVICE` | hostname | this machine's name in a shared collection (env file or environment) |
+| `CCS_SYNC_EXCLUDE` | | project dirs or session ids that never sync (env file or environment) |
+| `CCS_BACKUP` | `~/.local/share/ccsearch/transcripts` | where transcript backups go; `off` to disable |
 
 ## Development
 
@@ -239,7 +302,8 @@ The tests cover parsing, an end-to-end index of three synthetic sessions (rankin
 correction, session exclusion, archiving; this one loads the embedding model), and the
 multi-device path against canned HydraDB chunks: parsing both chunk layouts, mixing local and
 remote sessions, device filters, ssh resume quoting, the hook installer, the sync lock and
-refused deletions.
+refused deletions. Also: credential masking, sync exclusion, incremental backups and restore,
+`ccs ask` excerpts and citations, and an MCP round trip.
 
 ## License
 

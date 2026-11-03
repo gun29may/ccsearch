@@ -12,6 +12,7 @@ turn carry just its first 80 characters. A hit from a session that is not in the
 is rebuilt from that text, and it resumes over ssh on the machine it came from.
 """
 
+import fnmatch
 import getpass
 import hashlib
 import json
@@ -22,9 +23,12 @@ import shlex
 import socket
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import httpx
+
+from ccs_redact import redact
 
 ENV_FILE = Path.home() / ".config" / "ccsearch" / "hydradb.env"
 BATCH = 50
@@ -39,7 +43,7 @@ def settings():
                 k, v = line.split("=", 1)
                 cfg[k.strip()] = v.strip()
     for k in ("HYDRADB_API_KEY", "HYDRADB_BASE_URL", "HYDRADB_DATABASE", "HYDRADB_COLLECTION",
-              "CCS_DEVICE"):
+              "CCS_DEVICE", "CCS_SYNC_EXCLUDE"):
         if os.environ.get(k):
             cfg[k] = os.environ[k]
     return cfg
@@ -138,8 +142,23 @@ def parse_item_id(iid):
     return (sid, int(t)) if sid and t.isdigit() else (None, None)
 
 
-def build_items(db, home):
-    """One app-knowledge item per meaningful turn of every indexed session."""
+def excluded(sid, cwd, project, patterns):
+    """Whether CCS_SYNC_EXCLUDE keeps this session on the machine: a pattern matches the project
+    dir (as ~/... or absolute, the dir itself or anything under it, globs allowed) or a session id
+    prefix."""
+    for p in patterns:
+        p = p.strip().rstrip("/")
+        if p and (sid.startswith(p) or any(
+                v and (fnmatch.fnmatch(v, p) or v == p or v.startswith(p + "/"))
+                for v in (project, cwd))):
+            return True
+    return False
+
+
+def build_items(db, home, counts=None, skipped=None):
+    """One app-knowledge item per meaningful turn of every indexed session, credentials masked
+    (`counts` collects what was masked) and CCS_SYNC_EXCLUDE sessions left out (`skipped`)."""
+    patterns = (settings().get("CCS_SYNC_EXCLUDE") or "").split(",")
     sessions = db.execute(
         "SELECT session_id, cwd, title, ai_title, first_prompt FROM sessions").fetchall()
     actions = {}
@@ -147,8 +166,12 @@ def build_items(db, home):
         actions.setdefault(tid, []).append(text)
     items, device = [], device_name()
     for sid, cwd, title, ai_title, first_prompt in sessions:
-        name = title or ai_title or (first_prompt or "")[:60]
+        name = redact(title or ai_title or (first_prompt or "")[:60])
         project = (cwd or "?").replace(home, "~", 1)
+        if excluded(sid, cwd, project, patterns):
+            if skipped is not None:
+                skipped.add(sid)
+            continue
         turns = db.execute("SELECT id, ts, kind, prompt, reply FROM turns "
                            "WHERE session_id=? ORDER BY id", (sid,)).fetchall()
         for idx, (tid, ts, kind, prompt, reply) in enumerate(turns):
@@ -163,7 +186,8 @@ def build_items(db, home):
                     body += f"\n\nClaude: {reply}"
                 if actions.get(tid):
                     body += "\n\nActions: " + "; ".join(actions[tid])
-            body = f"Device: {device}\nSession: {name}\nProject: {project}\n\n{body}"[:BODY_MAX]
+            body = redact(f"Device: {device}\nSession: {name}\nProject: {project}\n\n{body}",
+                          counts)[:BODY_MAX]
             iid = item_id(sid, idx)
             items.append({
                 "id": iid, "title": f"{name} — {(ts or '')[:10]}",
@@ -212,13 +236,19 @@ def sync(db, home, dry_run=False, exclude=None):
 def _sync(db, home, dry_run, exclude):
     db.execute("CREATE TABLE IF NOT EXISTS hydra_sync(item_id TEXT PRIMARY KEY, hash TEXT)")
     sent = dict(db.execute("SELECT item_id, hash FROM hydra_sync"))
-    items = [it for it in build_items(db, home)
+    masked, skipped = Counter(), set()
+    items = [it for it in build_items(db, home, masked, skipped)
              if not exclude or not it["id"].startswith(exclude)]
     want = {it["id"]: _hash(it) for it in items}
     todo = [it for it in items if sent.get(it["id"]) != want[it["id"]]]
     gone = [iid for iid in sent if iid not in want]
     print(f"ccs sync ({device_name()}) → {len(items)} turns, {len(todo)} new/changed, "
           f"{len(gone)} to delete", file=sys.stderr)
+    if masked:
+        print(f"  masked {sum(masked.values())} credential(s): "
+              + ", ".join(f"{k} {n}" for k, n in masked.most_common()), file=sys.stderr)
+    if skipped:
+        print(f"  {len(skipped)} session(s) kept local by CCS_SYNC_EXCLUDE", file=sys.stderr)
     if dry_run or (not todo and not gone):
         return {"sent": 0, "deleted": 0, "failed": 0}
     h = Hydra()

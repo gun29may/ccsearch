@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ccsearch"
-version = "0.2.0"
+version = "0.3.0"
 description = "Search your Claude Code sessions in natural language and jump back into them"
 readme = "README.md"
 license = "MIT"
@@ -30,7 +30,7 @@ ccs = "ccsearch:main"
 Homepage = "https://github.com/gun29may/ccsearch"
 
 [tool.setuptools]
-py-modules = ["ccsearch", "ccs_hydra"]
+py-modules = ["ccsearch", "ccs_hydra", "ccs_redact", "ccs_mcp"]
 
 [tool.ruff]
 line-length = 100
