@@ -68,6 +68,7 @@ ccs --json "s3 upload script" | jq '.[0].resume'
 | `--include-current` | inside Claude Code the session you are in is hidden; this shows it |
 | `--stats`, `--reindex` | index size, or a rebuild from scratch |
 | `-H`, `-t`, `--sync` | search with HydraDB instead (see [below](#hydradb-backend-optional)) |
+| `--device NAME` | only sessions from one machine (see [several machines](#several-machines)) |
 
 Picking a result runs `claude --resume <id>` in the session's original directory. Inside Claude
 Code you can run it as `! ccs "…"`, or just ask Claude to find a past chat; it can call
@@ -135,10 +136,56 @@ Environment variables of the same names override the file; `HYDRADB_BASE_URL` de
 `https://api.hydradb.com`. `--sync` uploads each turn as one `message` item with the id
 `<session>__tNNNN`. Only new or changed turns are sent. Items of archived sessions are kept.
 
-**What leaves your machine:** for every turn, the session title, project directory, your prompt,
-Claude's final reply and the tool-action descriptions. That includes anything you pasted into
-a prompt, such as keys or customer data. Search results are filtered and shown locally, just
-like local search.
+**What leaves your machine:** for every turn, the machine's name, the session title, project
+directory, your prompt, Claude's final reply and the tool-action descriptions. That includes
+anything you pasted into a prompt, such as keys or customer data. Search results are filtered
+and shown locally, just like local search.
+
+### Several machines
+
+Give every machine the same database and collection, and a name:
+
+```bash
+# ~/.config/ccsearch/hydradb.env, on each machine
+HYDRADB_API_KEY=sk_live_...
+HYDRADB_COLLECTION=yourname
+CCS_DEVICE=dgx               # defaults to the hostname; best set to the name you ssh to
+
+ccs --install-hook           # sync whenever a Claude Code session ends on this machine
+```
+
+`ccs -H` then finds sessions from every machine. A session that lives elsewhere is shown
+"on <device>", with the command that resumes it there:
+
+```console
+ 2. frozen label sweep  Oct 01 → Oct 02 · on dgx · ~/lab/frozen labels
+    Oct 02 05:00  run 3 diverged after the learning-rate warmup, why
+    ssh -t dgx "cd ~/'lab/frozen labels' && claude --resume 33916e3b-e7cf-4cd0-8f21-91862f0e4333"
+```
+
+- **Picking it** runs that ssh command. Transcripts never leave their machine, so a session
+  resumes where it lives.
+- **Filters:** `--device NAME` limits a search to one machine. `-p`, `--since` and `--until`
+  work on remote sessions too; for them, dates come from the turns that matched.
+- **Plain `ccs`** stays local.
+
+**The hook.** `--install-hook` adds this to `~/.claude/settings.json`, keeping a backup;
+`--uninstall-hook` removes it:
+
+```json
+{ "hooks": { "SessionEnd": [ { "hooks": [
+  { "type": "command", "command": "/path/to/ccs --sync --background", "timeout": 30 } ] } ] } }
+```
+
+`--sync --background` detaches at once, so closing Claude Code never waits on it, and it logs
+to `~/.cache/ccsearch/sync.log`. A lock keeps two syncs from overlapping. A deletion HydraDB
+refuses while an item is still indexing is retried by the next sync.
+
+**How remote results are built.** `/query` returns a chunk's text but not the title or
+metadata an item was uploaded with. Later chunks of a long turn carry only the turn's first 80
+characters. So every item starts with a `Device:` line, then `Session:` and `Project:`. A hit
+from a session that isn't in the local index is rebuilt from that text. Upgrading from 0.1
+changes every item once, so the first sync re-uploads all turns.
 
 ## Evaluation
 
@@ -179,6 +226,7 @@ Results on the author's sessions (32 sessions and about 3,300 turns, 2026-10-29)
 | `CCS_PROJECTS` | `~/.claude/projects` | where transcripts are read from |
 | `CCS_CACHE` | `~/.cache/ccsearch` | where the index lives |
 | `HYDRADB_*` | `~/.config/ccsearch/hydradb.env` | HydraDB backend, see above |
+| `CCS_DEVICE` | hostname | this machine's name in a shared collection (env file or environment) |
 
 ## Development
 
@@ -187,8 +235,11 @@ pip install -e ".[hydradb,dev]"
 ruff check . && pytest -q
 ```
 
-The end-to-end test indexes three synthetic sessions and checks ranking, typo correction,
-session exclusion and archiving; it loads the embedding model.
+The tests cover parsing, an end-to-end index of three synthetic sessions (ranking, typo
+correction, session exclusion, archiving; this one loads the embedding model), and the
+multi-device path against canned HydraDB chunks: parsing both chunk layouts, mixing local and
+remote sessions, device filters, ssh resume quoting, the hook installer, the sync lock and
+refused deletions.
 
 ## License
 

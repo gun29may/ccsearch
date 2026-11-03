@@ -19,6 +19,8 @@ import difflib
 import json
 import os
 import re
+import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -553,6 +555,17 @@ def _home(p):
 
 def hydrate(db, results):
     for r in results:
+        if "remote" in r:  # synced from another machine: only what HydraDB returned
+            info, mom = r.pop("remote"), sorted(r.pop("remote_moments"), key=lambda m: m["ts"] or "")
+            ts = [m["ts"] for m in mom if m["ts"]]
+            r.update({"cwd": info["project"], "title": info["name"], "ai_title": None,
+                      "first_ts": min(ts, default=None), "last_ts": max(ts, default=None),
+                      "n_prompts": None, "first_prompt": None, "forked_from": None,
+                      "branch": None, "archived": 0, "device": info["device"],
+                      "name": info["name"] or "?", "moments": mom, "links": []})
+            r["resume"] = hydra_mod().show_command(hydra_mod().remote_command(
+                info["device"], info["project"], r["session_id"]))
+            continue
         s = db.execute(
             "SELECT cwd, title, ai_title, first_ts, last_ts, n_prompts, first_prompt, forked_from, "
             "branch, archived FROM sessions WHERE session_id=?", (r["session_id"],)).fetchone()
@@ -600,7 +613,8 @@ def show(results, query_shown):
         if last != span:
             span += f" → {last}"
         print()
-        where = f"{span} · {r['n_prompts']} prompts · {_home(r['cwd'])}"
+        size = f"on {r['device']}" if r.get("device") else f"{r['n_prompts']} prompts"
+        where = f"{span} · {size} · {_home(r['cwd'])}"
         print(f"{_c('1;36', f'{i:>2}.')} {_c('1', r['name'])}  {_c('2', where)}")
         if r.get("why"):
             print(f"    {_c('33', '★ ' + r['why'])}")
@@ -611,7 +625,9 @@ def show(results, query_shown):
                 txt = m["prompt"]
             txt = txt if len(txt) <= 150 else txt[:147] + "…"
             print(f"    {_c('2', _local(m['ts']))}  {txt}")
-        if r.get("archived"):
+        if r.get("device"):
+            print(f"    {_c('32', r['resume'])}")
+        elif r.get("archived"):
             print(f"    {_c('2', 'transcript deleted by Claude Code cleanup; searchable, not resumable')}")
         else:
             print(f"    {_c('32', 'claude --resume ' + r['session_id'])}")
@@ -628,6 +644,10 @@ def pick_and_resume(results):
     if not choice.isdigit() or not 1 <= int(choice) <= len(results):
         return
     r = results[int(choice) - 1]
+    if r.get("device"):
+        cmd = hydra_mod().remote_command(r["device"], r["cwd"], r["session_id"])
+        print(_c("2", f"→ {r['resume']}"))
+        os.execvp(cmd[0], cmd)
     if r.get("archived"):
         print("that transcript was deleted by Claude Code's cleanup, so it can't be resumed")
         return
@@ -655,7 +675,8 @@ RERANK_SYS = (
 def _digest(i, r):
     lines = [f"### {i}. {r['name']}",
              f"dir: {_home(r['cwd'])} | {_local(r['first_ts'], '%Y-%m-%d')} → "
-             f"{_local(r['last_ts'], '%Y-%m-%d')} | {r['n_prompts']} prompts"]
+             f"{_local(r['last_ts'], '%Y-%m-%d')} | "
+             + (f"on {r['device']}" if r.get("device") else f"{r['n_prompts']} prompts")]
     if r["first_prompt"]:
         lines.append(f"first prompt: {r['first_prompt'][:200]}")
     for m in r["moments"]:
@@ -698,6 +719,62 @@ def rerank(query, results, model_name):
     return reordered
 
 
+# --------------------------------------------------------------------------- sync plumbing
+
+SETTINGS = Path.home() / ".claude" / "settings.json"
+HOOK_ARGS = "--sync --background"
+
+
+def hydra_mod():
+    import ccs_hydra
+
+    return ccs_hydra
+
+
+def install_hook(remove=False, settings=None):
+    """Add (or remove) a SessionEnd hook that syncs to HydraDB when a Claude Code session ends."""
+    settings = settings or SETTINGS
+    try:
+        cfg = json.loads(settings.read_text()) if settings.exists() else {}
+    except json.JSONDecodeError as e:
+        sys.exit(f"ccs: {settings} is not valid JSON ({e}); fix it first")
+    groups = cfg.setdefault("hooks", {}).setdefault("SessionEnd", [])
+    ours = lambda h: h.get("type") == "command" and HOOK_ARGS in h.get("command", "")  # noqa: E731
+    for g in groups:
+        g["hooks"] = [h for h in g.get("hooks", []) if not ours(h)]
+    groups[:] = [g for g in groups if g.get("hooks")]
+    if not remove:
+        exe = shutil.which("ccs") or str(Path(sys.argv[0]).resolve())
+        groups.append({"hooks": [{"type": "command", "command": f"{shlex.quote(exe)} {HOOK_ARGS}",
+                                  "timeout": 30}]})
+    if not groups:
+        del cfg["hooks"]["SessionEnd"]
+    if not cfg["hooks"]:
+        del cfg["hooks"]
+    if settings.exists():
+        shutil.copy2(settings, settings.with_name(settings.name + ".ccs-backup"))
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps(cfg, indent=2) + "\n")
+    return groups[-1]["hooks"][0]["command"] if not remove else None
+
+
+def detach(log):
+    """Fork into the background (double fork, new session) with output appended to `log`;
+    the caller returns at once, so a SessionEnd hook never holds Claude Code's exit."""
+    if os.fork():
+        os._exit(0)
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    null = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(null, 0)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    print(f"--- {dt.datetime.now().isoformat(timespec='seconds')} ccs {HOOK_ARGS}", flush=True)
+
+
 # --------------------------------------------------------------------------- main
 
 def main(argv=None):
@@ -722,9 +799,26 @@ def main(argv=None):
                     help="search with HydraDB instead of the local index")
     hy.add_argument("-t", "--thinking", action="store_true",
                     help="with -H: thinking mode (LLM query understanding + graph, slower)")
+    hy.add_argument("--device", metavar="NAME",
+                    help="only sessions from this machine (implies -H; see CCS_DEVICE)")
     hy.add_argument("--sync", action="store_true",
                     help="push new/changed turns to HydraDB, then show indexing status")
+    hy.add_argument("--background", action="store_true",
+                    help=f"with --sync: detach at once and log to {CACHE / 'sync.log'}")
+    hy.add_argument("--install-hook", action="store_true",
+                    help="sync automatically whenever a Claude Code session ends")
+    hy.add_argument("--uninstall-hook", action="store_true", help="remove that hook")
     args = ap.parse_args(argv)
+    if args.install_hook or args.uninstall_hook:
+        cmd = install_hook(remove=args.uninstall_hook)
+        print(f"ccs: removed the SessionEnd hook from {SETTINGS}" if args.uninstall_hook
+              else f"ccs: added a SessionEnd hook to {SETTINGS}: {cmd}")
+        return
+    if args.background:
+        if not args.sync:
+            ap.error("--background goes with --sync")
+        detach(CACHE / "sync.log")
+    args.hydra = args.hydra or bool(args.device)
 
     db = connect()
     update_index(db, force=args.reindex)
@@ -736,8 +830,7 @@ def main(argv=None):
         print(f"{n_s} sessions ({n_a} with deleted transcripts), {n_t} turns, {n_c} chunks · "
               f"{DB_PATH} ({DB_PATH.stat().st_size / 1e6:.0f} MB)")
     if args.sync:
-        import ccs_hydra as hydra
-
+        hydra = hydra_mod()
         print(hydra.sync(db, str(Path.home())))
         print("HydraDB indexing (sample):", hydra.indexing_report(db))
     query = " ".join(args.query).strip()
@@ -748,10 +841,24 @@ def main(argv=None):
 
     pool = max(args.n, 15) if args.ask else args.n
     if args.hydra:
-        import ccs_hydra as hydra
-
+        hydra = hydra_mod()
         allowed = allowed_sessions(db, args.project, args.since, args.until, here)
-        results, _ = hydra.search(db, query, k=pool * 2, allowed=allowed,
+        if args.device and args.device != hydra.device_name():
+            allowed = set()  # every session in the local index is from this machine
+
+        def keep_remote(sid, info, moments):
+            """The same filters for sessions synced from other machines, judged on what
+            HydraDB returned: dates come from the matched turns only."""
+            if sid == here or (args.device and info["device"] != args.device):
+                return False
+            if args.project and not any(args.project.lower() in (v or "").lower()
+                                        for v in (info["project"], info["name"])):
+                return False
+            ts = [m["ts"] for m in moments if m["ts"]]
+            return not ts or not ((args.since and max(ts) < args.since)
+                                  or (args.until and min(ts) > args.until + "T23:59:59"))
+
+        results, _ = hydra.search(db, query, k=pool * 2, allowed=allowed, keep_remote=keep_remote,
                                   mode="thinking" if args.thinking else "fast")
         fixes = {}
     else:
