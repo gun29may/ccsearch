@@ -1,0 +1,2 @@
+{"qid": "hand00", "kind": "hand", "query": "the chat where the wifi driver kept dropping", "gold": ["a1b2c3d4"]}
+{"qid": "hand01", "kind": "hand", "query": "flaky retry test in the payments client", "gold": ["3f2a9c10", "77d0e4b2"]}

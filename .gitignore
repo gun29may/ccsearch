@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# never commit credentials
+*.env
+.env*
+
+# eval data is generated from your own sessions: keep it local
+eval/queries_hand.jsonl
+eval/queries_gen.jsonl
+eval/gen_cache/
+eval/results/
+eval/exclude.txt
