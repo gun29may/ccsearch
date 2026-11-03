@@ -45,7 +45,7 @@ pip install -e ".[hydradb]"
 
 Drop `[hydradb]` if you only want local search. The first run downloads the
 [Model2Vec](https://github.com/MinishLab/model2vec) embedding model
-`minishlab/potion-retrieval-32M` (about 250 MB on disk) and indexes every transcript; after that
+`minishlab/potion-retrieval-32M` (about 125 MB) and indexes every transcript; after that
 only changed transcripts are re-read.
 
 ## Usage

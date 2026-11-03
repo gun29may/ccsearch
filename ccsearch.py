@@ -259,14 +259,19 @@ def model():
     if _model is None:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        from huggingface_hub import snapshot_download
         from model2vec import StaticModel
 
-        try:  # cached after the first run; skip the network round-trip
-            os.environ["HF_HUB_OFFLINE"] = "1"
-            _model = StaticModel.from_pretrained(MODEL_NAME)
+        # huggingface_hub reads HF_HUB_OFFLINE once at import, so toggling it can't express
+        # "cache first, network on a miss"; resolve the folder explicitly and load from disk
+        want = ["*.json", "*.safetensors", "*.txt"]  # not the onnx copy of the weights
+        try:
+            path = snapshot_download(MODEL_NAME, allow_patterns=want, local_files_only=True)
         except Exception:
-            os.environ["HF_HUB_OFFLINE"] = "0"
-            _model = StaticModel.from_pretrained(MODEL_NAME)
+            print(f"ccs: downloading the embedding model {MODEL_NAME} (first run only)…",
+                  file=sys.stderr)
+            path = snapshot_download(MODEL_NAME, allow_patterns=want)
+        _model = StaticModel.from_pretrained(path)
     return _model
 
 

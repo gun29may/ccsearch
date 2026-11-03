@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "model2vec>=0.4"]
+dependencies = ["numpy>=1.24", "model2vec>=0.4", "huggingface_hub>=0.20"]
 keywords = ["claude-code", "search", "cli", "bm25", "embeddings"]
 classifiers = [
     "Environment :: Console",
