@@ -298,6 +298,11 @@ pip install -e ".[hydradb,dev]"
 ruff check . && pytest -q
 ```
 
+[`AGENTS.md`](AGENTS.md) has the layout, the invariants that break silently (item ids, the item
+text format, backups, masking, the MCP stdout rule) and how to test against HydraDB without
+touching real data. It's written for coding agents (Claude Code loads it through `CLAUDE.md`)
+and works as contributor notes too.
+
 The tests cover parsing, an end-to-end index of three synthetic sessions (ranking, typo
 correction, session exclusion, archiving; this one loads the embedding model), and the
 multi-device path against canned HydraDB chunks: parsing both chunk layouts, mixing local and
