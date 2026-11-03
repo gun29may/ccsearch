@@ -36,5 +36,9 @@ py-modules = ["ccsearch", "ccs_hydra"]
 line-length = 100
 target-version = "py310"
 
+[tool.ruff.lint]
+# explicit, so newer ruff releases with broader defaults give the same result
+select = ["E4", "E7", "E9", "F"]  # ruff's classic default
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
